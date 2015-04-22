@@ -262,6 +262,7 @@ ggplot(accuracy_cv) +
   geom_bar(aes(y=values, x=data, fill=data), stat="identity")+
   facet_wrap(~model)+
   theme(axis.text.x  =element_blank())+
+  ylab("Accuracy")+
   geom_text(aes(y=values, x=data, label=round(values, digits=2)), vjust=0) 
 ```
 
@@ -281,6 +282,7 @@ ggplot(accuracy_test) +
   geom_bar(aes(y=values, x=data, fill=data), stat="identity")+
   facet_wrap(~model)+
   theme(axis.text.x  =element_blank())+
+  ylab("Accuracy")+
   geom_text(aes(y=values, x=data, label=round(values, digits=2)), vjust=0) 
 ```
 
