@@ -1,0 +1,296 @@
+---
+title: "Practical Machine Learning Course_Project"
+author: "Susann Vorberg"
+date: "22. April 2015"
+output: html_document
+---
+
+#Data 
+
+The training data for this project is available here: 
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data is available here (but is only used for the second part of the exercise): 
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+```{r}
+data_train <- read.csv("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", sep=",")
+data_test  <- read.csv("http://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", sep=",") 
+
+```
+
+There are `r nrow(data_train)` data samples in the training data set and `r nrow(data_test)` data samples in the test data set.
+The weight lifting exercises have been performed by `r length(unique(data_train$user_name))` different subjects named: `r unique(data_train$user_name)`.
+There are `r length(unique(data_train$classe))` different ways of doing the weight lifting exercise, that we want to predict. 
+For predicting the exercise class one can use `r length(names(data_train)) - 1` predictors.
+
+##Preparing the Environment
+```{r, message=FALSE, warning=FALSE}
+set.seed(32323)
+library(caret)
+library(foreach)
+library(doMC)
+registerDoMC(cores=4)
+```
+
+##Preparing the data
+
+First I divide the data into training data (~80%) that is used for tuning the models and test data(~20%) that I use to estimate the out of sample error.
+```{r}
+inTrain = createDataPartition(data_train$classe, p = 0.8)[[1]]
+train = data_train[ inTrain,]
+test  = data_train[-inTrain,]
+```
+
+The resulting training data set that I will use for cross validation has `r nrow(train)` data samples and the resulting test data set has `r nrow(test)` data samples.
+
+From looking at the data I found that many predictors contain "NA" or blank values. Therefore I excluded these predictors from my training and test dataset. 
+
+> As can be read in the [article](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201), these descriptors represent summary statistics of the time series data that has been calculated by the authors via a sliding window approach.
+
+```{r}
+test  = test[ ,(colSums(is.na(train)) == 0) & (apply(train, 2, function(x) sum(x %in% "")) == 0)]
+train = train[,(colSums(is.na(train)) == 0) & (apply(train, 2, function(x) sum(x %in% "")) == 0)]
+```
+
+Furthermore I excluded the predictors "X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window" as they are not relevant predictors according to the study design and the actual measured predictors. 
+
+> Again, as can be read in the article, the time stamps were used to calculate some of the summary statistics of the data that I excluded anyways.
+
+```{r}
+train = train[,-c(1:7)]
+test  = test[,-c(1:7)]
+```
+
+This leaves me with `r length(names(train)) - 1` predictors.
+
+#Preprocessing
+
+##Standardizing: Centering and Scaling
+
+Some machine learning methods are sensitive with respect to the range of the data. Therefore I will standardize the data (subtract mean and divide by standard deviation).  
+
+```{r}
+preProcObj <- preProcess(train[,-ncol(train)],method=c("center","scale"))
+trainStd <- predict(preProcObj, train[,-ncol(train)])
+testStd  <- predict(preProcObj, test[,-ncol(test)])
+
+```
+
+Now, the values of the numeric predictors are standardized:
+```{r}
+summary(train[,1])
+summary(trainStd[,1])
+```
+
+##Remove near zero variances
+
+Predictors with near zero variances can obscure the results of some machine learning methods, especially when applying cross validation and a predictor might only have a single unique value in one of the folds.
+
+```{r}
+nzv <- nearZeroVar(trainStd)
+##number of near zero variables
+length(nzv)
+```
+
+Fortunately, none of the features has near-zero variances.
+
+##Removing highly correlated features
+
+Highly correlated features do not give any additional information that might be useful for prediction but rather might complicate model generation. Therefore I remove predictors that show correlation with other features above 0.9.
+
+```{r}
+Cor <- cor(trainStd)
+highlyCorFeatures <- findCorrelation(Cor, cutoff = .9)
+highlyCorFeatures
+```
+There are 7 features that are highly correlated and can be excluded from the data set.
+
+```{r}
+trainStdCor <- trainStd[,-highlyCorFeatures]
+testStdCor <- testStd[,-highlyCorFeatures]
+trainStdCor$classe <- train$classe
+testStdCor$classe <- test$classe
+```
+
+
+
+##PCA for dimensionality reduction
+
+PCA can be used to reduce dimensionality and the effect of correlations between variables by finding linear combinations of the variables that explain as much as possible variance in the data.
+However, PCA is prone to outliers, which should be removed first (or data should be transformed otherwise). I found two outlier data points that I removed from the training data set.
+
+
+```{r}
+trainOutliers <-  train[-c(which(train[,31] < -100), which(train[,38] < -1000)), ]
+preProc       <- preProcess(trainOutliers[,-ncol(trainOutliers)], method="pca", thresh=0.9) 
+print(preProc)
+trainPC <- predict(preProc,trainOutliers[,-ncol(trainOutliers)])
+testPC <- predict(preProc,test[,-ncol(train)])
+trainPC$classe <- train[-c(which(train[,31] < -100), which(train[,38] < -1000)),'classe']
+testPC$classe <- test$classe
+```
+
+As we can see in the following plot, the first two principle components span a broad range of values and some separation of the data classes is already visible
+
+```{r fig.width=7, fig.height=4, echo=FALSE}
+ggplot(trainPC) + 
+  geom_point(aes(x=PC1, y=PC2, group=classe, color=classe)) + 
+  xlab("Principal Component 1") +
+  ylab("Principal Component 2")
+
+```
+
+
+#Generating Models
+I will train several models using the different preprocessed training sets from above and evaluate the models based on a five-fold cross validation.
+
+```{r eval=FALSE}
+fitControl <- trainControl(## 5-fold CV
+                           method = "cv",
+                           number = 5,
+                           ##for parallalization
+                           allowParallel=TRUE
+                           )
+```
+
+
+##Random Forest
+```{r eval=FALSE}
+RFModel         <- train(classe ~., data=train, method="rf", trControl = fitControl)
+print(RFModel)
+print(RFModel$finalModel)
+confusionMatrix(RFModel)
+pred_RF <- predict(RFModel,test)
+confusionMatrix(pred_RF,test$classe)
+
+RFModel_StdCor  <- train(classe ~., data=trainStdCor, method="rf", trControl = fitControl)
+print(RFModel_StdCor)
+print(RFModel_StdCor$finalModel)
+confusionMatrix(RFModel_StdCor)
+pred_RF_StdCor <- predict(RFModel_StdCor,testStdCor)
+confusionMatrix(pred_RF_StdCor,testStdCor$classe)
+
+RFModel_PC      <- train(classe ~., data=trainPC, method="rf", trControl = fitControl)
+print(RFModel_PC)
+print(RFModel_PC$finalModel)
+confusionMatrix(RFModel_PC)
+pred_RF_PC <- predict(RFModel_PC,testPC)
+confusionMatrix(pred_RF_PC,testPC$classe)
+```
+
+
+###LDA
+```{r eval=FALSE}
+LDA_Model = train(classe ~., data=train, method="lda", trControl = fitControl)
+print(LDA_Model)
+confusionMatrix(LDA_Model)
+pred_LDA <- predict(LDA_Model,test)
+confusionMatrix(pred_LDA,test$classe)
+    
+LDA_Model_StdCor = train(classe ~., data=trainStdCor, method="lda", trControl = fitControl)
+print(LDA_Model_StdCor)
+confusionMatrix(LDA_Model_StdCor)
+pred_LDA_StdCor <- predict(LDA_Model_StdCor,testStdCor)
+confusionMatrix(pred_LDA_StdCor,testStdCor$classe)
+
+LDA_Model_PC     = train(classe ~., data=trainPC, method="lda", trControl = fitControl)
+print(LDA_Model_PC)
+confusionMatrix(LDA_Model_PC)
+pred_LDA_PC <- predict(LDA_Model_PC, testPC)
+confusionMatrix(pred_LDA_PC,testPC$classe)
+```
+
+
+
+##Rpart
+```{r eval=FALSE}
+Tree_Model = train(classe ~., data=train, method="rpart",trControl = fitControl)
+print(Tree_Model)
+confusionMatrix(Tree_Model)
+pred_Tree <- predict(Tree_Model, test) 
+confusionMatrix(pred_Tree,test$classe)
+
+Tree_Model_StdCor = train(classe ~., data=trainStdCor, method="rpart",trControl = fitControl)
+print(Tree_Model_StdCor)
+confusionMatrix(Tree_Model_StdCor)
+pred_Tree_StdCor <- predict(Tree_Model_StdCor, testStdCor)
+confusionMatrix(pred_Tree_StdCor,testStdCor$classe)
+
+
+Tree_Model_PC     = train(classe ~., data=trainPC, method="rpart", trControl = fitControl)
+print(Tree_Model_PC)
+confusionMatrix(Tree_Model_PC)
+pred_Tree_PC <- predict(Tree_Model_PC, testPC)
+confusionMatrix(pred_Tree_PC,testPC$classe)
+```
+
+##GBM
+```{r eval=FALSE}
+gbm_Model <- train(classe ~., data=train, method="gbm", trControl = fitControl)
+print(gbm_Model)
+pred_gbm <- predict(gbm_Model, test)
+confusionMatrix(pred_gbm,test$classe)
+
+gbm_Model_StdCor <- train(classe ~., data=trainStdCor, method="gbm", trControl = fitControl)
+print(gbm_Model_StdCor)
+pred_gbm_StdCor <- predict(gbm_Model_StdCor, testStdCor)
+confusionMatrix(pred_gbm_StdCor,testStdCor$classe)
+
+gbm_Model_PC <- train(classe ~., data=trainPC, method="gbm", trControl = fitControl)
+print(gbm_Model_PC)
+pred_gbm_PC <- predict(gbm_Model_PC, testPC)
+confusionMatrix(pred_gbm_PC,testPC$classe)
+``
+
+#Evaluation
+
+In the following tables and plots I summarize the accuracy of the different models for the three preprocessed training sets as well as for the respective test data sets.
+
+##Accuracy CV 
+|               | no preprocessing | standardized + correlation removed | PCA |
+| ------------- | -----------------|----------------------------------- | --- |
+| Random Forest | 0.9923561 | 0.9926108 | 0.9734361 |
+| Decision Tree | 0.5119433 | 0.5140472 | 0.3912210 |
+| LDA           | 0.7018919 | 0.67501   | 0.4930882 |
+| GBM           | 0.9610812 |0.9590422|0.7987650|
+
+```{r fig.width=7, fig.height=6, echo=FALSE}
+accuracy_cv = data.frame(values=c(0.9923561 , 0.9926108 , 0.9734361, 0.5119433 , 0.5140472 , 0.3912210, 0.7018919, 0.67501, 0.4930882, 0.9610812 ,0.9590422, 0.7987650), model=c("Random Forest","Random Forest","Random Forest","Decision Tree","Decision Tree","Decision Tree","LDA","LDA","LDA", "GBM", "GBM", "GBM"), data=c("no preproc", "std + corr removed", "PCA","no preproc", "std + corr removed", "PCA","no preproc", "std + corr removed", "PCA","no preproc", "std + corr removed", "PCA"))
+
+ggplot(accuracy_cv) + 
+  geom_bar(aes(y=values, x=data, fill=data), stat="identity")+
+  facet_wrap(~model)+
+  theme(axis.text.x  =element_blank())+
+  geom_text(aes(y=values, x=data, label=round(values, digits=2)), vjust=0) 
+```
+
+##Accuracy Test Set
+
+|                        | no preprocessing | standardized + correlation removed | PCA |
+| ---------------------- | -----------------|----------------------------------- | --- |
+| Random Forest          | 0.9921 | 0.9959 | 0.9788 |
+| Decision Tree          | 0.4991 | 0.4945 | 0.3706 |
+| LDA                    | 0.6979 | 0.676  | 0.4938 |
+| GBM                    | 0.9602 | 0.9633 | 0.8032 |
+
+```{r fig.width=7, fig.height=6, echo=FALSE}
+accuracy_test = data.frame(values=c(0.9921  , 0.9959 , 0.9788, 0.4991 , 0.4945 , 0.3706, 0.6979 , 0.676  , 0.4938, 0.9602, 0.9633, 0.8032), model=c("Random Forest","Random Forest","Random Forest","Decision Tree","Decision Tree","Decision Tree","LDA","LDA","LDA", "GBM", "GBM", "GBM"), data=c("no preproc", "std + corr removed", "PCA","no preproc", "std + corr removed", "PCA","no preproc", "std + corr removed", "PCA","no preproc", "std + corr removed", "PCA"))
+
+ggplot(accuracy_test) + 
+  geom_bar(aes(y=values, x=data, fill=data), stat="identity")+
+  facet_wrap(~model)+
+  theme(axis.text.x  =element_blank())+
+  geom_text(aes(y=values, x=data, label=round(values, digits=2)), vjust=0) 
+```
+
+
+The expected out of sample error (as 1 - accuracy) is smallest for the **Random Forest** model on the data set that has been **standardized and highly correlated predictors have been removed**: `1 - 0.9959`.
+
+Therefore I choose this model as my final model.
+
+
+
+
+
+
